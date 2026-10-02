@@ -57,6 +57,32 @@ For scripts without a terminal, supply `--id`, `--season`, and `--episode`.
 The CLI reports ambiguous choices instead of silently selecting a different anime.
 Progress goes to stderr; search results and `--url` output go to stdout.
 
+## Shell completion
+
+Generate completions for Zsh, Bash, Fish, PowerShell, or Elvish with
+`animecix --completions <shell>`. Completion generation works offline.
+Tab completes flags, provider names, shell names, and paths for `--player`.
+
+For the current Zsh session:
+
+```sh
+source <(animecix --completions zsh)
+```
+
+For future Oh My Zsh sessions:
+
+```sh
+mkdir -p ~/.oh-my-zsh/custom/completions
+animecix --completions zsh > ~/.oh-my-zsh/custom/completions/_animecix
+exec zsh
+```
+
+Fractional episode numbers are supported in both the episode menu and flags:
+
+```sh
+animecix --id 25 -s 1 -e 13.5
+```
+
 ## Default video player
 
 On **macOS**, the CLI queries the default MP4 **viewer** app, then opens a

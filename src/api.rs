@@ -17,7 +17,7 @@ pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Ap
 pub struct Video {
     pub id: Option<u64>,
     pub name: Option<String>,
-    pub episode_num: Option<u32>,
+    pub episode_num: Option<f64>,
     pub season_num: Option<u32>,
     pub url: String,
 }

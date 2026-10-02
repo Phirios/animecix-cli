@@ -4,7 +4,8 @@ mod relay;
 mod streams;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueHint};
+use clap_complete::Shell;
 use dialoguer::{FuzzySelect, Input, Select, theme::ColorfulTheme};
 use serde_json::Value;
 use std::{collections::BTreeSet, io::IsTerminal};
@@ -30,10 +31,11 @@ struct Args {
     id: Option<u64>,
     #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
     season: Option<u32>,
-    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
-    episode: Option<u32>,
+    /// Episode number, including specials such as 13.5
+    #[arg(short, long, value_parser = parse_episode)]
+    episode: Option<f64>,
     /// Override default MP4 app (e.g. /Applications/VLC.app, vlc, or mpv)
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::FilePath)]
     player: Option<String>,
     /// Choose a host; default tries supported hosts in order
     #[arg(long, value_parser = ["auto", "tau-video", "ok", "sibnet", "uqload", "google-drive"], default_value = "auto")]
@@ -44,6 +46,9 @@ struct Args {
     /// Print the remote stream URL instead of opening a player (no relay)
     #[arg(long)]
     url: bool,
+    /// Generate shell completion without connecting to Animecix
+    #[arg(long, value_enum)]
+    completions: Option<Shell>,
 }
 
 #[tokio::main]
@@ -55,6 +60,15 @@ async fn main() {
 }
 
 async fn run(args: Args) -> Result<()> {
+    if let Some(shell) = args.completions {
+        clap_complete::generate(
+            shell,
+            &mut Args::command(),
+            "animecix",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let theme = ColorfulTheme::default();
     let mut query = args.query.join(" ");
@@ -133,12 +147,7 @@ async fn run(args: Args) -> Result<()> {
         .into_iter()
         .filter(|v| v.season_num.is_none_or(|s| s == season))
         .collect();
-    let episodes: Vec<_> = videos
-        .iter()
-        .map(|v| v.episode_num.unwrap_or(1))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let episodes = episode_numbers(&videos);
     if episodes.is_empty() {
         bail!("No videos available for season {season}");
     }
@@ -158,7 +167,7 @@ async fn run(args: Args) -> Result<()> {
     };
     let mut candidates: Vec<_> = videos
         .into_iter()
-        .filter(|v| v.episode_num.unwrap_or(1) == episode)
+        .filter(|v| v.episode_num.unwrap_or(1.0) == episode)
         .filter(|v| streams::provider(v) != "unsupported")
         .filter(|v| args.provider == "auto" || args.provider == streams::provider(v))
         .collect();
@@ -299,6 +308,26 @@ fn choose(labels: &[String], prompt: &str, interactive: bool, fuzzy: bool) -> Re
     result.context("Selection cancelled")
 }
 
+fn parse_episode(input: &str) -> std::result::Result<f64, String> {
+    let number: f64 = input
+        .parse()
+        .map_err(|_| "Expected an episode number such as 1 or 13.5".to_owned())?;
+    if !number.is_finite() || number < 0.0 {
+        return Err("Episode number must be finite and nonnegative".into());
+    }
+    Ok(number)
+}
+
+fn episode_numbers(videos: &[api::Video]) -> Vec<f64> {
+    let mut numbers: Vec<_> = videos
+        .iter()
+        .map(|v| v.episode_num.unwrap_or(1.0))
+        .collect();
+    numbers.sort_by(f64::total_cmp);
+    numbers.dedup();
+    numbers
+}
+
 fn season_numbers(title: &Value) -> Vec<u32> {
     let seasons: BTreeSet<_> = title["seasons"]
         .as_array()
@@ -322,6 +351,58 @@ fn season_numbers(title: &Value) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fractional_episodes_parse_sort_and_select_without_truncation() {
+        let videos: Vec<api::Video> = serde_json::from_value(serde_json::json!([
+            {"url": "https://example.test/14", "episode_num": 14},
+            {"url": "https://example.test/special", "episode_num": 13.5},
+            {"url": "https://example.test/13", "episode_num": 13},
+            {"url": "https://example.test/special-duplicate", "episode_num": 13.5}
+        ]))
+        .unwrap();
+        assert_eq!(episode_numbers(&videos), [13.0, 13.5, 14.0]);
+        let args =
+            Args::try_parse_from(["animecix", "--id", "25", "-s", "1", "-e", "13.5"]).unwrap();
+        assert_eq!(args.episode, Some(13.5));
+        assert_eq!(
+            videos
+                .iter()
+                .filter(|v| v.episode_num == args.episode)
+                .count(),
+            2
+        );
+        for value in ["NaN", "inf", "-1"] {
+            assert!(parse_episode(value).is_err());
+        }
+    }
+
+    #[test]
+    fn completion_contains_options_and_provider_values_for_supported_shells() {
+        for shell in [
+            Shell::Zsh,
+            Shell::Bash,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let mut output = Vec::new();
+            clap_complete::generate(shell, &mut Args::command(), "animecix", &mut output);
+            let output = String::from_utf8(output).unwrap();
+            assert!(
+                output.contains("episode"),
+                "missing episode completion for {shell}"
+            );
+            if matches!(shell, Shell::Zsh | Shell::Bash | Shell::Fish) {
+                assert!(
+                    output.contains("tau-video"),
+                    "missing provider values for {shell}"
+                );
+            }
+        }
+        let args = Args::try_parse_from(["animecix", "--completions", "zsh"]).unwrap();
+        assert_eq!(args.completions, Some(Shell::Zsh));
+    }
+
     #[test]
     fn supports_season_shapes_and_removes_duplicates() {
         let title =
