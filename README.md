@@ -62,6 +62,8 @@ Progress goes to stderr; search results and `--url` output go to stdout.
 Generate completions for Zsh, Bash, Fish, PowerShell, or Elvish with
 `animecix --completions <shell>`. Completion generation works offline.
 Tab completes flags, provider names, shell names, and paths for `--player`.
+In Zsh, press Tab after `animecix ` to list options; anime queries do not fall
+back to local filenames.
 
 For the current Zsh session:
 

@@ -8,7 +8,10 @@ use clap::{CommandFactory, Parser, ValueHint};
 use clap_complete::Shell;
 use dialoguer::{FuzzySelect, Input, Select, theme::ColorfulTheme};
 use serde_json::Value;
-use std::{collections::BTreeSet, io::IsTerminal};
+use std::{
+    collections::BTreeSet,
+    io::{IsTerminal, Write},
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -61,12 +64,7 @@ async fn main() {
 
 async fn run(args: Args) -> Result<()> {
     if let Some(shell) = args.completions {
-        clap_complete::generate(
-            shell,
-            &mut Args::command(),
-            "animecix",
-            &mut std::io::stdout(),
-        );
+        std::io::stdout().write_all(&completion_script(shell)?)?;
         return Ok(());
     }
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
@@ -270,6 +268,38 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+fn completion_script(shell: Shell) -> Result<Vec<u8>> {
+    let mut command = Args::command();
+    let mut output = Vec::new();
+    clap_complete::generate(shell, &mut command, "animecix", &mut output);
+    if shell != Shell::Zsh {
+        return Ok(output);
+    }
+    let mut script = String::from_utf8(output)?;
+    // Anime names are not file paths. At an empty argument offer options;
+    // when a query is entered, leave the user's text intact.
+    script = script.replace(
+        "*::query -- Anime name (omit to enter it interactively):_default",
+        "*::query -- Anime name (omit to enter it interactively):_animecix_query",
+    );
+    let mut helper = String::from(
+        "_animecix_query() {\n    if [[ -n $PREFIX ]]; then\n        _message 'anime name (run animecix to search interactively)'\n        return\n    fi\n    local -a options\n    options=(\n",
+    );
+    for arg in command.get_arguments().filter(|a| !a.is_hide_set()) {
+        if let Some(long) = arg.get_long() {
+            let description = arg
+                .get_help()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| long.to_owned());
+            let entry = format!("--{long}:{}", description.replace(':', " "));
+            helper.push_str(&format!("        '{}'\n", entry.replace('\'', "'\\''")));
+        }
+    }
+    helper.push_str("    )\n    _describe -O -t options 'animecix options' options\n    local result=$?\n    compstate[insert]=''\n    compstate[list]=list\n    return $result\n}\n\n");
+    script = script.replacen("_animecix() {", &format!("{helper}_animecix() {{"), 1);
+    Ok(script.into_bytes())
+}
+
 fn safe_error(error: &anyhow::Error) -> String {
     error
         .to_string()
@@ -385,9 +415,7 @@ mod tests {
             Shell::PowerShell,
             Shell::Elvish,
         ] {
-            let mut output = Vec::new();
-            clap_complete::generate(shell, &mut Args::command(), "animecix", &mut output);
-            let output = String::from_utf8(output).unwrap();
+            let output = String::from_utf8(completion_script(shell).unwrap()).unwrap();
             assert!(
                 output.contains("episode"),
                 "missing episode completion for {shell}"
