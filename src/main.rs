@@ -1,7 +1,10 @@
 mod api;
+mod download;
+mod network;
 mod player;
 mod relay;
 mod streams;
+mod terminal;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, ValueHint};
@@ -13,6 +16,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     io::{IsTerminal, Write},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -20,8 +24,8 @@ use std::{
 #[command(
     name = "animecix",
     version,
-    about = "Search Animecix and stream directly in your local video player",
-    after_help = "Examples:\n  animecix \"one piece\"\n  animecix --search naruto\n  animecix --id 7293 --season 4 --episode 1\n  animecix naruto --player /Applications/VLC.app\n\nKeep the CLI running while watching. Ctrl+C stops the local streaming relay."
+    about = "Search Animecix, stream in your video player, or download episodes",
+    after_help = "Examples:\n  animecix \"one piece\"\n  animecix --search naruto\n  animecix --id 7293 --season 4 --episode 1\n  animecix naruto --player /Applications/VLC.app\n  animecix --id 7293 -s 4 -e 1 --download episode.mp4\n\nKeep the CLI running while watching. Ctrl+C stops streaming or cancels a download."
 )]
 struct Args {
     /// Anime name (omit to enter it interactively)
@@ -52,6 +56,9 @@ struct Args {
     /// Print the remote stream URL instead of opening a player (no relay)
     #[arg(long)]
     url: bool,
+    /// Save the selected episode to a file instead of playing (HLS needs ffmpeg)
+    #[arg(short = 'd', long, value_name = "FILE", value_hint = ValueHint::FilePath, conflicts_with_all = ["url", "search", "player", "completions"])]
+    download: Option<PathBuf>,
     /// Generate shell completion without connecting to Animecix
     #[arg(long, value_enum)]
     completions: Option<Shell>,
@@ -60,7 +67,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run(Args::parse()).await {
-        eprintln!("Error: {error:#}");
+        eprintln!("Error: {}", terminal::text(&format!("{error:#}")));
         std::process::exit(1);
     }
 }
@@ -69,6 +76,9 @@ async fn run(args: Args) -> Result<()> {
     if let Some(shell) = args.completions {
         std::io::stdout().write_all(&completion_script(shell)?)?;
         return Ok(());
+    }
+    if let Some(path) = &args.download {
+        download::check_destination(path)?;
     }
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let theme = ColorfulTheme::default();
@@ -95,13 +105,20 @@ async fn run(args: Args) -> Result<()> {
                 let results = with_loading("Searching Animecix", api.search(query.trim())).await?;
                 if args.search {
                     if args.json {
-                        println!("{}", serde_json::to_string_pretty(&results)?);
+                        println!(
+                            "{}",
+                            terminal::json(&serde_json::to_string_pretty(&results)?)
+                        );
                     } else {
                         if results.is_empty() {
                             println!("No anime found for {query:?}");
                         }
                         for title in results {
-                            println!("{}\t{}", api::title_id(&title)?, api::title_name(&title));
+                            println!(
+                                "{}\t{}",
+                                terminal::text(&api::title_id(&title)?),
+                                api::title_name(&title)
+                            );
                         }
                     }
                     return Ok(());
@@ -115,7 +132,7 @@ async fn run(args: Args) -> Result<()> {
                         format!(
                             "{}  [ID {}]",
                             api::title_name(v),
-                            api::title_id(v).unwrap_or_default()
+                            terminal::text(&api::title_id(v).unwrap_or_default())
                         )
                     })
                     .collect();
@@ -139,44 +156,24 @@ async fn run(args: Args) -> Result<()> {
         } else {
             name
         };
-        eprintln!("{name}  [ID {id}]");
+        let name = terminal::text(&name);
+        eprintln!("{name}  [ID {}]", terminal::text(&id));
         let seasons = season_numbers(&title);
-        let tmdb_series =
+        let metadata_enabled =
+            interactive && !args.url && (args.season.is_none() || args.episode.is_none());
+        let tmdb_series = if metadata_enabled {
             match with_loading("Loading TMDB series metadata", api.tmdb_series(&title)).await {
                 Ok(series) => series,
                 Err(error) => {
                     eprintln!("TMDB series metadata unavailable: {}", safe_error(&error));
                     None
                 }
-            };
+            }
+        } else {
+            None
+        };
         let mut season_videos = BTreeMap::new();
         let mut tmdb_seasons = BTreeMap::new();
-        if tmdb_series.is_some() {
-            for season in &seasons {
-                if let Ok(Some(metadata)) = with_loading(
-                    &format!("Loading TMDB season {season}"),
-                    api.tmdb_season(&title, *season),
-                )
-                .await
-                {
-                    tmdb_seasons.insert(*season, metadata);
-                }
-                if let Ok(videos) = with_loading(
-                    &format!("Loading Animecix season {season}"),
-                    api.videos(&id, *season),
-                )
-                .await
-                {
-                    season_videos.insert(
-                        *season,
-                        videos
-                            .into_iter()
-                            .filter(|video| video.season_num.is_none_or(|s| s == *season))
-                            .collect::<Vec<_>>(),
-                    );
-                }
-            }
-        }
         let (season, episode, videos) = 'episode_selection: loop {
             let season = match args.season {
                 Some(n) => n,
@@ -205,17 +202,35 @@ async fn run(args: Args) -> Result<()> {
                     }
                 }
             };
-            let videos: Vec<_> = match season_videos.get(&season) {
-                Some(videos) => videos.clone(),
-                None => with_loading(
-                    &format!("Loading Animecix season {season}"),
-                    api.videos(&id, season),
-                )
-                .await?
-                .into_iter()
-                .filter(|v| v.season_num.is_none_or(|s| s == season))
-                .collect(),
-            };
+            if let std::collections::btree_map::Entry::Vacant(entry) = season_videos.entry(season) {
+                let loading_label = format!("Loading season {season}");
+                let (videos, metadata) = tokio::join!(
+                    with_loading(&loading_label, api.videos(&id, season)),
+                    async {
+                        if metadata_enabled {
+                            api.tmdb_season(&title, season).await
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                );
+                entry.insert(
+                    videos?
+                        .into_iter()
+                        .filter(|v| v.season_num.is_none_or(|s| s == season))
+                        .collect::<Vec<_>>(),
+                );
+                match metadata {
+                    Ok(Some(metadata)) => {
+                        tmdb_seasons.insert(season, metadata);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("TMDB season metadata unavailable: {}", safe_error(&error))
+                    }
+                }
+            }
+            let videos = season_videos[&season].clone();
             let episodes = episode_numbers(&videos);
             if episodes.is_empty() {
                 bail!("No videos available for season {season}");
@@ -258,7 +273,7 @@ async fn run(args: Args) -> Result<()> {
             labels.extend(candidates.iter().map(|v| {
                 format!(
                     "{}  [video {}]",
-                    v.name.as_deref().unwrap_or(streams::provider(v)),
+                    terminal::text(v.name.as_deref().unwrap_or(streams::provider(v))),
                     v.id.map(|n| n.to_string()).unwrap_or_default()
                 )
             }));
@@ -294,7 +309,10 @@ async fn run(args: Args) -> Result<()> {
                         || s.label.trim_end_matches('p') == quality.trim_end_matches('p')
                 });
                 if sources.is_empty() {
-                    eprintln!("  Requested quality {quality} is unavailable");
+                    eprintln!(
+                        "  Requested quality {} is unavailable",
+                        terminal::text(quality)
+                    );
                     continue;
                 }
             } else if interactive && args.quality.is_none() && !args.url && sources.len() > 1 {
@@ -325,6 +343,11 @@ async fn run(args: Args) -> Result<()> {
             .context("No playable stream found. Try a different host, quality, or episode")?;
         if args.url {
             println!("{}", source.url);
+            break 'anime_selection Ok(());
+        }
+        if let Some(path) = &args.download {
+            download::save(client, &source, path).await?;
+            eprintln!("Saved {}", terminal::text(&path.display().to_string()));
             break 'anime_selection Ok(());
         }
         let relay = relay::start(client, &source).await?;
@@ -378,12 +401,13 @@ fn completion_script(shell: Shell) -> Result<Vec<u8>> {
 }
 
 fn safe_error(error: &anyhow::Error) -> String {
-    error
-        .to_string()
-        .split(" for url")
-        .next()
-        .unwrap_or("Host error")
-        .to_owned()
+    terminal::text(
+        error
+            .to_string()
+            .split(" for url")
+            .next()
+            .unwrap_or("Host error"),
+    )
 }
 
 async fn with_loading<T, F>(label: &str, future: F) -> Result<T>
@@ -423,7 +447,7 @@ fn choose(labels: &[String], prompt: &str, interactive: bool, fuzzy: bool) -> Re
     if labels.is_empty() {
         bail!("No choices available for {prompt}");
     }
-    if labels.len() == 1 {
+    if labels.len() == 1 && !interactive {
         return Ok(Choice::Selected(0));
     }
     if !interactive {
@@ -436,67 +460,92 @@ fn choose(labels: &[String], prompt: &str, interactive: bool, fuzzy: bool) -> Re
     let mut selected = 0;
     let mut rendered_lines = 0;
     term.hide_cursor()?;
-    let result = loop {
-        let matches: Vec<_> = labels
-            .iter()
-            .enumerate()
-            .filter(|(_, label)| !fuzzy || label.to_lowercase().contains(&filter.to_lowercase()))
-            .collect();
-        if matches.is_empty() {
-            selected = 0;
-        } else {
-            selected = selected.min(matches.len() - 1);
-        }
-        if rendered_lines > 0 {
-            term.clear_last_lines(rendered_lines)?;
-        }
-        term.write_line(&format!("? {prompt}  (press i for more info, ←/Esc back)"))?;
-        if fuzzy && !filter.is_empty() {
-            term.write_line(&format!("  Filter: {filter}"))?;
-        }
-        if matches.is_empty() {
-            term.write_line("  No matching choices")?;
-        } else {
-            for (position, (_, label)) in matches.iter().enumerate() {
-                if position == selected {
-                    let highlighted =
-                        label.replace("\x1b[0m", "\x1b[0m\x1b[48;5;24m\x1b[38;5;255m");
-                    term.write_line(&format!(
-                        "\x1b[48;5;24m\x1b[38;5;255m❯ {highlighted}\x1b[0m"
-                    ))?;
-                } else {
-                    term.write_line(&format!("  {label}"))?;
+    let result = (|| -> Result<Choice> {
+        loop {
+            let matches: Vec<_> = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, label)| {
+                    !fuzzy || label.to_lowercase().contains(&filter.to_lowercase())
+                })
+                .collect();
+            if matches.is_empty() {
+                selected = 0;
+            } else {
+                selected = selected.min(matches.len() - 1);
+            }
+            if rendered_lines > 0 {
+                term.clear_last_lines(rendered_lines)?;
+            }
+            let (rows, columns) = term.size();
+            let width = usize::from(columns).saturating_sub(1).max(1);
+            let capacity = usize::from(rows).saturating_sub(4).max(1);
+            let start = selected.saturating_sub(capacity - 1);
+            let visible = &matches[start..matches.len().min(start + capacity)];
+            term.write_line(&console::truncate_str(
+                &format!("? {prompt}  (? info, ←/Esc back)"),
+                width,
+                "…",
+            ))?;
+            if fuzzy && !filter.is_empty() {
+                term.write_line(&console::truncate_str(
+                    &format!("  Filter: {filter}"),
+                    width,
+                    "…",
+                ))?;
+            }
+            if matches.is_empty() {
+                term.write_line("  No matching choices")?;
+            } else {
+                for (position, (_, label)) in visible.iter().enumerate() {
+                    let label = console::truncate_str(label, width.saturating_sub(2), "…");
+                    if start + position == selected {
+                        let highlighted =
+                            label.replace("\x1b[0m", "\x1b[0m\x1b[48;5;24m\x1b[38;5;255m");
+                        term.write_line(&format!(
+                            "\x1b[48;5;24m\x1b[38;5;255m❯ {highlighted}\x1b[0m"
+                        ))?;
+                    } else {
+                        term.write_line(&format!("  {label}"))?;
+                    }
                 }
             }
+            rendered_lines = 1 + usize::from(fuzzy && !filter.is_empty()) + visible.len().max(1);
+            term.flush()?;
+            match term.read_key()? {
+                Key::ArrowDown | Key::Tab if !matches.is_empty() => {
+                    selected = (selected + 1) % matches.len();
+                }
+                Key::ArrowUp | Key::BackTab if !matches.is_empty() => {
+                    selected = selected.checked_sub(1).unwrap_or(matches.len() - 1);
+                }
+                Key::ArrowLeft | Key::Escape | Key::CtrlC => break Ok(Choice::Back),
+                Key::Char('?') if !matches.is_empty() => {
+                    break Ok(Choice::Info(matches[selected].0));
+                }
+                Key::Enter if !matches.is_empty() => {
+                    break Ok(Choice::Selected(matches[selected].0));
+                }
+                Key::Backspace if fuzzy => {
+                    filter.pop();
+                    selected = 0;
+                }
+                Key::Char(character) if fuzzy && !character.is_ascii_control() => {
+                    filter.push(character);
+                    selected = 0;
+                }
+                _ => {}
+            }
         }
-        rendered_lines = 1 + usize::from(fuzzy && !filter.is_empty()) + matches.len().max(1);
-        term.flush()?;
-        match term.read_key()? {
-            Key::ArrowDown | Key::Tab if !matches.is_empty() => {
-                selected = (selected + 1) % matches.len();
-            }
-            Key::ArrowUp | Key::BackTab if !matches.is_empty() => {
-                selected = selected.checked_sub(1).unwrap_or(matches.len() - 1);
-            }
-            Key::ArrowLeft | Key::Escape => break Choice::Back,
-            Key::Char('i') if !matches.is_empty() => break Choice::Info(matches[selected].0),
-            Key::Enter if !matches.is_empty() => break Choice::Selected(matches[selected].0),
-            Key::Backspace if fuzzy => {
-                filter.pop();
-                selected = 0;
-            }
-            Key::Char('q') if filter.is_empty() => break Choice::Back,
-            Key::Char(character) if fuzzy && !character.is_ascii_control() => {
-                filter.push(character);
-                selected = 0;
-            }
-            _ => {}
-        }
-    };
-    term.clear_last_lines(rendered_lines)?;
-    term.show_cursor()?;
-    term.flush()?;
-    Ok(result)
+    })();
+    let cleanup = term.clear_last_lines(rendered_lines);
+    let cursor = term.show_cursor();
+    let flush = term.flush();
+    let choice = result?;
+    cleanup?;
+    cursor?;
+    flush?;
+    Ok(choice)
 }
 
 fn choose_with_info(
@@ -578,7 +627,10 @@ fn season_label(
 fn search_info(title: &Value) -> String {
     let mut info = format!("\x1b[1;36m{}\x1b[0m", api::title_name(title));
     if let Ok(id) = api::title_id(title) {
-        info.push_str(&format!("\n\x1b[1;33mAnimecix ID:\x1b[0m {id}"));
+        info.push_str(&format!(
+            "\n\x1b[1;33mAnimecix ID:\x1b[0m {}",
+            terminal::text(&id)
+        ));
     }
     for (label, key) in [
         ("Release date", "release_date"),
@@ -587,7 +639,10 @@ fn search_info(title: &Value) -> String {
         ("Description", "description"),
     ] {
         if let Some(value) = title[key].as_str().map(str::trim).filter(|v| !v.is_empty()) {
-            info.push_str(&format!("\n\x1b[1;33m{label}:\x1b[0m {value}"));
+            info.push_str(&format!(
+                "\n\x1b[1;33m{label}:\x1b[0m {}",
+                terminal::text(value)
+            ));
         }
     }
     info
@@ -776,6 +831,39 @@ fn season_numbers(title: &Value) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn download_flags_and_completions() {
+        let args = Args::try_parse_from([
+            "animecix",
+            "--id",
+            "25",
+            "-s",
+            "1",
+            "-e",
+            "1",
+            "--download",
+            "episode.mp4",
+        ])
+        .unwrap();
+        assert_eq!(args.download, Some(PathBuf::from("episode.mp4")));
+        for conflicting in ["--url", "--search", "--player", "--completions"] {
+            let mut args = vec!["animecix", "--download", "episode.mp4", conflicting];
+            if conflicting == "--player" {
+                args.push("vlc");
+            }
+            if conflicting == "--completions" {
+                args.push("zsh");
+            }
+            assert!(
+                Args::try_parse_from(args).is_err(),
+                "accepted {conflicting}"
+            );
+        }
+        assert!(Args::try_parse_from(["animecix", "--download"]).is_err());
+        let completions = String::from_utf8(completion_script(Shell::Zsh).unwrap()).unwrap();
+        assert!(completions.contains("download"));
+    }
+
     #[test]
     fn fractional_episodes_parse_sort_and_select_without_truncation() {
         let videos: Vec<api::Video> = serde_json::from_value(serde_json::json!([

@@ -1,9 +1,10 @@
+use crate::network::Client;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rand::RngCore;
 use reqwest::{
-    Client, Url,
+    Url,
     cookie::{CookieStore, Jar},
 };
 use serde::{Deserialize, Serialize};
@@ -53,8 +54,8 @@ pub fn title_name(title: &Value) -> String {
     ["name", "name_english", "name_romanji", "title", "titleName"]
         .iter()
         .find_map(|key| title[*key].as_str())
-        .unwrap_or("Unknown title")
-        .to_owned()
+        .map(crate::terminal::text)
+        .unwrap_or_else(|| "Unknown title".to_owned())
 }
 
 pub fn title_id(title: &Value) -> Result<String> {
@@ -77,11 +78,7 @@ pub struct Api {
 impl Api {
     pub async fn new() -> Result<Self> {
         let jar = Arc::new(Jar::default());
-        let client = Client::builder()
-            .cookie_provider(jar.clone())
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = Client::with_cookies(jar.clone())?;
         let api = Self { client, jar };
         api.bootstrap().await?;
         Ok(api)
@@ -91,7 +88,8 @@ impl Api {
         for attempt in 1..=3 {
             let response = self
                 .client
-                .get(format!("{BASE}/secure/bootstrap-data"))
+                .get(format!("{BASE}/secure/bootstrap-data"))?
+                .timeout(Duration::from_secs(30))
                 .query(&[("original_url", format!("{BASE}/"))])
                 .send()
                 .await?;
@@ -113,18 +111,18 @@ impl Api {
         for attempt in 1..=3 {
             let mut request = self
                 .client
-                .get(url.clone())
+                .get(url.as_str())?
+                .timeout(Duration::from_secs(30))
                 .header("Origin", BASE)
                 .header("Accept", "application/json")
                 .header("X-E-H", signed_query(url.query().unwrap_or(""))?);
-            if let Some(cookies) = self.jar.cookies(&Url::parse(BASE)?) {
-                if let Some(token) = cookies
+            if let Some(cookies) = self.jar.cookies(&Url::parse(BASE)?)
+                && let Some(token) = cookies
                     .to_str()?
                     .split("; ")
                     .find_map(|c| c.strip_prefix("XSRF-TOKEN="))
-                {
-                    request = request.header("X-XSRF-TOKEN", token);
-                }
+            {
+                request = request.header("X-XSRF-TOKEN", token);
             }
             let response = request.send().await?;
             let status = response.status();
@@ -210,8 +208,8 @@ impl Api {
         Ok(Some(TmdbSeries {
             name: data[if is_movie { "title" } else { "name" }]
                 .as_str()
-                .unwrap_or("Unknown title")
-                .to_owned(),
+                .map(crate::terminal::text)
+                .unwrap_or_else(|| "Unknown title".to_owned()),
             first_air_date: string_field(
                 &data,
                 if is_movie {
@@ -248,7 +246,7 @@ impl Api {
             .filter_map(|episode| {
                 Some(TmdbEpisode {
                     episode_number: episode["episode_number"].as_f64()?,
-                    name: episode["name"].as_str()?.trim().to_owned(),
+                    name: crate::terminal::text(episode["name"].as_str()?.trim()),
                     air_date: string_field(episode, "air_date"),
                     runtime: episode["runtime"].as_u64(),
                     vote_average: episode["vote_average"].as_f64(),
@@ -258,7 +256,7 @@ impl Api {
             .filter(|episode| !episode.name.is_empty())
             .collect();
         Ok(Some(TmdbSeason {
-            name: data["name"].as_str().unwrap_or("Season").to_owned(),
+            name: crate::terminal::text(data["name"].as_str().unwrap_or("Season")),
             air_date: string_field(&data, "air_date"),
             overview: string_field(&data, "overview"),
             episodes,
@@ -268,7 +266,8 @@ impl Api {
     async fn tmdb_get(&self, path: &str, credential: &TmdbCredential) -> Result<Value> {
         let mut request = self
             .client
-            .get(format!("https://api.themoviedb.org/3{path}"))
+            .get(format!("https://api.themoviedb.org/3{path}"))?
+            .timeout(Duration::from_secs(30))
             .query(&[("language", "en-US")])
             .header("Accept", "application/json");
         request = match credential {
@@ -325,7 +324,7 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+        .map(crate::terminal::text)
 }
 
 fn transient(status: u16) -> bool {

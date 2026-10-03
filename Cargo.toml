@@ -2,8 +2,11 @@
 name = "animecix-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Search Animecix and stream anime in your local video player"
-rust-version = "1.85"
+description = "Search Animecix, stream anime in your video player, or download episodes"
+rust-version = "1.88"
+repository = "https://github.com/Phirios/animecix-cli"
+readme = "README.md"
+license = "MIT"
 
 [[bin]]
 name = "animecix"
@@ -18,10 +21,11 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 console = "0.16"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "fs", "io-util", "process"] }

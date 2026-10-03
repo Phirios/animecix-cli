@@ -1,3 +1,4 @@
+use crate::network::Client;
 use crate::streams::Source;
 use anyhow::Result;
 use axum::{
@@ -8,8 +9,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use futures_util::StreamExt;
 use regex::Regex;
-use reqwest::{Client, Url};
+use reqwest::Url;
 use std::sync::{Arc, Mutex};
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -81,12 +83,14 @@ async fn handle(
             // Do not print signed stream URLs from reqwest errors.
             eprintln!(
                 "Stream request failed: {}",
-                error
-                    .root_cause()
-                    .to_string()
-                    .split(" for url")
-                    .next()
-                    .unwrap_or("upstream error")
+                crate::terminal::text(
+                    error
+                        .root_cause()
+                        .to_string()
+                        .split(" for url")
+                        .next()
+                        .unwrap_or("upstream error")
+                )
             );
             (StatusCode::BAD_GATEWAY, "Video host request failed").into_response()
         }
@@ -101,14 +105,14 @@ async fn forward(
 ) -> Result<Response> {
     let mut request = state
         .client
-        .request(method.clone(), url)
+        .request(method.clone(), url)?
         .header("Referer", &state.referer);
     for name in ["range", "if-range", "if-none-match", "if-modified-since"] {
         if let Some(value) = headers.get(name) {
             request = request.header(name, value);
         }
     }
-    let response = request.send().await?;
+    let mut response = request.send().await?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -116,7 +120,8 @@ async fn forward(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_owned();
-    let hls = response.url().path().ends_with(".m3u8") || content_type.contains("mpegurl");
+    let hls = response.url().path().ends_with(".m3u8")
+        || content_type.to_ascii_lowercase().contains("mpegurl");
     let mut builder = Response::builder().status(status);
     for name in [
         "content-type",
@@ -136,9 +141,12 @@ async fn forward(
         }
         return Ok(builder.body(Body::empty())?);
     }
-    if hls && status.is_success() {
+    let mut prefix = crate::network::peek(&mut response).await?;
+    if (hls || crate::network::hls_prefix(&prefix)) && status.is_success() {
         let base = response.url().clone();
-        let playlist = rewrite_playlist(&response.text().await?, &base, |url| {
+        prefix.extend_from_slice(&response.bytes().await?);
+        let playlist = rewrite_playlist(&String::from_utf8_lossy(&prefix), &base, |url| {
+            state.client.validate(&url)?;
             let mut urls = state.urls.lock().expect("URL registry poisoned");
             let index = if let Some(index) = urls.iter().position(|s| s == url.as_str()) {
                 index
@@ -149,9 +157,17 @@ async fn forward(
             let filename = if url.path().ends_with(".m3u8") {
                 "playlist.m3u8"
             } else {
-                "segment"
+                // Keep conventional segment extensions for FFmpeg's HLS
+                // validation, without putting upstream paths in local URLs.
+                match url.path().rsplit('.').next() {
+                    Some("mp4") => "segment.mp4",
+                    Some("m4s") => "segment.m4s",
+                    Some("aac") => "segment.aac",
+                    Some("mp3") => "segment.mp3",
+                    _ => "segment.ts",
+                }
             };
-            format!("{}/{index}/{filename}", state.prefix)
+            Ok(format!("{}/{index}/{filename}", state.prefix))
         })?;
         Ok(builder
             .header("content-type", "application/vnd.apple.mpegurl")
@@ -160,14 +176,17 @@ async fn forward(
         if let Some(value) = response.headers().get("content-length") {
             builder = builder.header("content-length", value);
         }
-        Ok(builder.body(Body::from_stream(response.bytes_stream()))?)
+        let body =
+            futures_util::stream::once(async move { Ok::<_, reqwest::Error>(prefix.into()) })
+                .chain(response.bytes_stream());
+        Ok(builder.body(Body::from_stream(body))?)
     }
 }
 
 fn rewrite_playlist(
     text: &str,
     base: &Url,
-    mut register: impl FnMut(Url) -> String,
+    mut register: impl FnMut(Url) -> Result<String>,
 ) -> Result<String> {
     let uri = Regex::new(r#"URI="([^"]+)""#)?;
     let mut output = String::new();
@@ -179,16 +198,18 @@ fn rewrite_playlist(
                 let url = base.join(&capture[1])?;
                 if ["http", "https"].contains(&url.scheme()) {
                     rewritten =
-                        rewritten.replace(&capture[0], &format!("URI=\"{}\"", register(url)));
+                        rewritten.replace(&capture[0], &format!("URI=\"{}\"", register(url)?));
+                } else {
+                    anyhow::bail!("Unsupported HLS URI scheme");
                 }
             }
             output.push_str(&rewritten);
         } else if !line.is_empty() {
             let url = base.join(line)?;
             if ["http", "https"].contains(&url.scheme()) {
-                output.push_str(&register(url));
+                output.push_str(&register(url)?);
             } else {
-                output.push_str(line);
+                anyhow::bail!("Unsupported HLS URI scheme");
             }
         }
         output.push('\n');
@@ -207,13 +228,33 @@ mod tests {
         let output = rewrite_playlist(
             input,
             &Url::parse("https://host.test/hls/list.m3u8").unwrap(),
-            |url| format!("local:{url}"),
+            |url| Ok(format!("local:{url}")),
         )
         .unwrap();
         assert!(output.contains("URI=\"local:https://host.test/key\""));
         assert!(output.contains("URI=\"local:https://host.test/hls/init.mp4\""));
         assert!(output.contains("local:https://host.test/hls/part.ts"));
         assert!(output.contains("local:https://cdn.test/next.m3u8"));
+    }
+
+    #[test]
+    fn rejects_local_and_non_http_playlist_targets() {
+        for target in [
+            "http://127.0.0.1/private",
+            "http://192.168.1.1/admin",
+            "file:///etc/passwd",
+        ] {
+            let c = Client::new().unwrap();
+            let result = rewrite_playlist(
+                &format!("#EXTM3U\n{target}\n"),
+                &Url::parse("https://cdn.test/master.m3u8").unwrap(),
+                |url| {
+                    c.validate(&url)?;
+                    Ok("local".into())
+                },
+            );
+            assert!(result.is_err(), "accepted {target}");
+        }
     }
 
     #[tokio::test]
@@ -241,7 +282,7 @@ mod tests {
             )
             .into_future(),
         );
-        let client = crate::streams::client().unwrap();
+        let client = Client::for_test();
         let relay = start(
             client.clone(),
             &Source {
@@ -255,6 +296,7 @@ mod tests {
         .unwrap();
         let result = client
             .get(&relay.url)
+            .unwrap()
             .header("Range", "bytes=2-4")
             .send()
             .await
@@ -265,6 +307,7 @@ mod tests {
         assert_eq!(
             client
                 .get(relay.url.replace("/0/", "/99/"))
+                .unwrap()
                 .send()
                 .await
                 .unwrap()
@@ -276,7 +319,7 @@ mod tests {
             relay.url.split('/').take(3).collect::<Vec<_>>().join("/")
         );
         assert_eq!(
-            client.get(unknown).send().await.unwrap().status(),
+            client.get(unknown).unwrap().send().await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
         upstream.abort();

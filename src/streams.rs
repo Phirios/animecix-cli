@@ -1,7 +1,8 @@
-use crate::api::{USER_AGENT, Video};
+use crate::api::Video;
+use crate::network::Client;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use reqwest::{Client, Url};
+use reqwest::Url;
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
@@ -15,11 +16,7 @@ pub struct Source {
 }
 
 pub fn client() -> Result<Client> {
-    Ok(Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(30))
-        .build()?)
+    Client::new()
 }
 
 pub fn provider(video: &Video) -> &str {
@@ -62,7 +59,7 @@ pub fn score(source: &Source) -> u32 {
 
 async fn text(client: &Client, url: &str, referer: &str) -> Result<String> {
     Ok(client
-        .get(url)
+        .get(url)?
         .header("Referer", referer)
         .send()
         .await?
@@ -94,7 +91,7 @@ pub async fn resolve(client: &Client, video: &Video) -> Result<Vec<Source>> {
             }
             let mut data = None;
             for attempt in 1..=4 {
-                let response = client.get(api.clone()).send().await?;
+                let response = client.get(api.as_str())?.send().await?;
                 if response.status().as_u16() == 429 && attempt < 4 {
                     let seconds = response
                         .headers()
@@ -120,10 +117,10 @@ pub async fn resolve(client: &Client, video: &Video) -> Result<Vec<Source>> {
                     }
                 }
             }
-            if pairs.is_empty() {
-                if let Some(hls) = data["hls"].as_str() {
-                    pairs = hls_options(client, hls, &video.url).await?;
-                }
+            if pairs.is_empty()
+                && let Some(hls) = data["hls"].as_str()
+            {
+                pairs = hls_options(client, hls, &video.url).await?;
             }
         }
         "sibnet" | "uqload" => {
@@ -159,10 +156,10 @@ pub async fn resolve(client: &Client, video: &Video) -> Result<Vec<Source>> {
                     }
                 }
             }
-            if pairs.is_empty() {
-                if let Some(hls) = data["ondemandHls"].as_str() {
-                    pairs = hls_options(client, hls, &video.url).await?;
-                }
+            if pairs.is_empty()
+                && let Some(hls) = data["ondemandHls"].as_str()
+            {
+                pairs = hls_options(client, hls, &video.url).await?;
             }
         }
         "google-drive" => {
@@ -187,7 +184,7 @@ pub async fn resolve(client: &Client, video: &Video) -> Result<Vec<Source>> {
         }
         if !sources.iter().any(|s: &Source| s.url == url.as_str()) {
             sources.push(Source {
-                label,
+                label: crate::terminal::text(&label),
                 url: url.to_string(),
                 referer: video.url.clone(),
                 provider: host.into(),
@@ -228,27 +225,32 @@ pub fn extract_sources(html: &str) -> Vec<(String, String)> {
 }
 
 async fn hls_options(client: &Client, url: &str, referer: &str) -> Result<Vec<(String, String)>> {
-    let playlist = text(client, url, referer).await?;
-    let base = Url::parse(url)?;
+    let response = client
+        .get(url)?
+        .header("Referer", referer)
+        .send()
+        .await?
+        .error_for_status()?;
+    let base = response.url().clone();
+    let playlist = response.text().await?;
     let lines: Vec<_> = playlist.lines().map(str::trim).collect();
     let re = Regex::new(r"RESOLUTION=\d+x(\d+)")?;
     let mut options = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if line.starts_with("#EXT-X-STREAM-INF:") {
-            if let Some(uri) = lines[i + 1..]
+        if line.starts_with("#EXT-X-STREAM-INF:")
+            && let Some(uri) = lines[i + 1..]
                 .iter()
                 .find(|l| !l.is_empty() && !l.starts_with('#'))
-            {
-                let label = re
-                    .captures(line)
-                    .map(|m| format!("{}p", &m[1]))
-                    .unwrap_or("HLS".into());
-                options.push((label, base.join(uri)?.to_string()));
-            }
+        {
+            let label = re
+                .captures(line)
+                .map(|m| format!("{}p", &m[1]))
+                .unwrap_or("HLS".into());
+            options.push((label, base.join(uri)?.to_string()));
         }
     }
     if options.is_empty() {
-        options.push(("HLS".into(), url.into()));
+        options.push(("HLS".into(), base.to_string()));
     }
     Ok(options)
 }
@@ -296,7 +298,7 @@ fn base_n(mut n: usize, radix: u32) -> String {
 
 pub async fn verify(client: &Client, source: &Source) -> Result<()> {
     let response = client
-        .get(&source.url)
+        .get(&source.url)?
         .header("Referer", &source.referer)
         .header("Range", "bytes=0-1023")
         .send()
@@ -317,6 +319,52 @@ pub async fn verify(client: &Client, source: &Source) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn hls_uses_redirect_destination_and_provider_cookies() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode},
+            response::Redirect,
+            routing::get,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(axum::serve(listener, Router::new()
+            .route("/entry/master.m3u8", get(|| async {
+                ([("set-cookie", "session=needed; Path=/")], Redirect::temporary("/actual/master.m3u8"))
+            }))
+            .route("/actual/master.m3u8", get(|headers: HeaderMap| async move {
+                if headers.get("cookie").is_some_and(|c| c == "session=needed") {
+                    (StatusCode::OK, "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1280x720\nvariant.m3u8\n")
+                } else { (StatusCode::FORBIDDEN, "missing cookie") }
+            }))
+            .route("/actual/variant.m3u8", get(|headers: HeaderMap| async move {
+                assert_eq!(headers["cookie"], "session=needed");
+                ([("content-type", "application/vnd.apple.mpegurl")], "#EXTM3U\nsegment.ts\n")
+            }))
+        ).into_future());
+        let c = Client::for_test();
+        let options = hls_options(&c, &format!("{base}/entry/master.m3u8"), &base)
+            .await
+            .unwrap();
+        assert_eq!(
+            options,
+            vec![("720p".into(), format!("{base}/actual/variant.m3u8"))]
+        );
+        verify(
+            &c,
+            &Source {
+                label: "720p".into(),
+                url: options[0].1.clone(),
+                referer: base,
+                provider: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        upstream.abort();
+    }
+
     #[test]
     fn extracts_relative_and_escaped_urls() {
         let sources = extract_sources(
