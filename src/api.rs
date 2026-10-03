@@ -8,7 +8,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 pub const BASE: &str = "https://animecix.tv";
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
@@ -20,6 +20,33 @@ pub struct Video {
     pub episode_num: Option<f64>,
     pub season_num: Option<u32>,
     pub url: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TmdbSeries {
+    pub name: String,
+    pub first_air_date: Option<String>,
+    pub runtime: Option<u64>,
+    pub vote_average: Option<f64>,
+    pub overview: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TmdbEpisode {
+    pub episode_number: f64,
+    pub name: String,
+    pub air_date: Option<String>,
+    pub runtime: Option<u64>,
+    pub vote_average: Option<f64>,
+    pub overview: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TmdbSeason {
+    pub name: String,
+    pub air_date: Option<String>,
+    pub overview: Option<String>,
+    pub episodes: Vec<TmdbEpisode>,
 }
 
 pub fn title_name(title: &Value) -> String {
@@ -164,6 +191,141 @@ impl Api {
         serde_json::from_value(data["title"]["videos"].clone())
             .context("Animecix returned no episode videos")
     }
+
+    pub async fn tmdb_series(&self, title: &Value) -> Result<Option<TmdbSeries>> {
+        let Some(credential) = tmdb_credential() else {
+            return Ok(None);
+        };
+        let Some(series_id) = tmdb_id(title) else {
+            return Ok(None);
+        };
+
+        let is_movie = tmdb_is_movie(title);
+        let data = self
+            .tmdb_get(
+                &format!("/{}/{series_id}", if is_movie { "movie" } else { "tv" }),
+                &credential,
+            )
+            .await?;
+        Ok(Some(TmdbSeries {
+            name: data[if is_movie { "title" } else { "name" }]
+                .as_str()
+                .unwrap_or("Unknown title")
+                .to_owned(),
+            first_air_date: string_field(
+                &data,
+                if is_movie {
+                    "release_date"
+                } else {
+                    "first_air_date"
+                },
+            ),
+            runtime: data["runtime"]
+                .as_u64()
+                .or_else(|| data["episode_run_time"][0].as_u64()),
+            vote_average: data["vote_average"].as_f64(),
+            overview: string_field(&data, "overview"),
+        }))
+    }
+
+    pub async fn tmdb_season(&self, title: &Value, season: u32) -> Result<Option<TmdbSeason>> {
+        let Some(credential) = tmdb_credential() else {
+            return Ok(None);
+        };
+        let Some(series_id) = tmdb_id(title) else {
+            return Ok(None);
+        };
+        if tmdb_is_movie(title) {
+            return Ok(None);
+        }
+        let data = self
+            .tmdb_get(&format!("/tv/{series_id}/season/{season}"), &credential)
+            .await?;
+        let episodes = data["episodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|episode| {
+                Some(TmdbEpisode {
+                    episode_number: episode["episode_number"].as_f64()?,
+                    name: episode["name"].as_str()?.trim().to_owned(),
+                    air_date: string_field(episode, "air_date"),
+                    runtime: episode["runtime"].as_u64(),
+                    vote_average: episode["vote_average"].as_f64(),
+                    overview: string_field(episode, "overview"),
+                })
+            })
+            .filter(|episode| !episode.name.is_empty())
+            .collect();
+        Ok(Some(TmdbSeason {
+            name: data["name"].as_str().unwrap_or("Season").to_owned(),
+            air_date: string_field(&data, "air_date"),
+            overview: string_field(&data, "overview"),
+            episodes,
+        }))
+    }
+
+    async fn tmdb_get(&self, path: &str, credential: &TmdbCredential) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("https://api.themoviedb.org/3{path}"))
+            .query(&[("language", "en-US")])
+            .header("Accept", "application/json");
+        request = match credential {
+            TmdbCredential::ApiKey(key) => request.query(&[("api_key", key)]),
+            TmdbCredential::AccessToken(token) => request.bearer_auth(token),
+        };
+        request
+            .send()
+            .await?
+            .error_for_status()
+            .context("TMDB request failed")?
+            .json()
+            .await
+            .context("TMDB returned invalid data")
+    }
+}
+
+enum TmdbCredential {
+    ApiKey(String),
+    AccessToken(String),
+}
+
+fn tmdb_credential() -> Option<TmdbCredential> {
+    env::var("TMDB_ACCESS_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(TmdbCredential::AccessToken)
+        .or_else(|| {
+            env::var("TMDB_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(TmdbCredential::ApiKey)
+        })
+}
+
+fn tmdb_id(title: &Value) -> Option<String> {
+    ["tmdb_id", "tmdbId", "tmdb"].iter().find_map(|key| {
+        title[*key]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| title[*key].as_u64().map(|id| id.to_string()))
+    })
+}
+
+fn tmdb_is_movie(title: &Value) -> bool {
+    ["type", "title_type", "format", "kind"]
+        .iter()
+        .filter_map(|key| title[*key].as_str())
+        .any(|value| value.eq_ignore_ascii_case("movie"))
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn transient(status: u16) -> bool {

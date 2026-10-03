@@ -25,8 +25,9 @@ cargo run -- "one piece"
 ```
 
 Use the arrow keys to select; type in the anime and episode menus to filter;
-press Enter to confirm. Esc cancels a selection. Auto host selection tries the
-supported providers until a working stream is found.
+press Enter to confirm. Esc or Left Arrow goes back to the previous selection.
+Auto host selection tries the supported providers until a working stream is
+found.
 
 ## Examples
 
@@ -85,6 +86,19 @@ Fractional episode numbers are supported in both the episode menu and flags:
 ```sh
 animecix --id 25 -s 1 -e 13.5
 ```
+
+Episode titles and metadata are loaded from TMDB when the Animecix title has a
+TMDB ID and one of these optional credentials is set. Season and episode menus
+show green, yellow, or red availability dots based on Animecix coverage. Press
+`i` in those menus to view the series, season, or episode metadata.
+
+```sh
+export TMDB_API_KEY="your-v3-api-key"
+# or: export TMDB_ACCESS_TOKEN="your-api-read-access-token"
+```
+
+If neither credential is set, the episode menu still works and shows episode
+numbers without titles.
 
 ## Default video player
 
