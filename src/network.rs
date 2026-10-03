@@ -137,15 +137,15 @@ fn allowed_ip(ip: IpAddr, allow_loopback: bool) -> bool {
 
 fn public_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
-    !ip.is_private()
-        && !ip.is_loopback()
-        && !ip.is_link_local()
-        && a != 0
-        && a < 224
-        && !(a == 100 && (64..=127).contains(&b))
-        && !(a == 192 && b == 0 && (c == 0 || c == 2))
-        && !(a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
-        && !(a == 203 && b == 0 && c == 113)
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || a == 0
+        || a >= 224
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
+        || (a == 203 && b == 0 && c == 113))
 }
 
 struct PublicDns {
