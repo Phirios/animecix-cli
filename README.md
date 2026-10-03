@@ -11,7 +11,8 @@ must still be available.
 Requires Rust 1.85+ and a network-capable video player such as VLC or IINA.
 
 ```sh
-cd /Volumes/Overflow/Overflow-Projects/animecix-cli
+git clone https://github.com/Phirios/animecix-cli.git
+cd animecix-cli
 cargo install --path . --locked
 animecix "one piece"
 ```
