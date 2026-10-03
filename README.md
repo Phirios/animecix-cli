@@ -1,13 +1,50 @@
 # animecix-cli
 
-A standalone Rust CLI for searching Animecix, choosing an anime, season, episode,
-video host and quality, and watching in your local video player or downloading
-an episode. It contacts Animecix and the video hosts directly. Your internet connection and the upstream
-sites must be available.
+A standalone CLI for watching and downloading **Turkish-subtitled anime from
+Animecix**. Choose an anime, season, episode, video host, and quality, then watch
+in a local video player or save an episode. Subtitle availability and quality
+come from Animecix and the selected provider; this CLI does not translate videos.
+It contacts Animecix and the hosts directly, so an internet connection is needed.
 
-## Install
+## Quick install
 
-Requires Rust 1.88+ and a network-capable video player such as VLC or IINA.
+### macOS / Homebrew
+
+```sh
+brew install phirios/tap/animecix
+brew install mpv  # optional player; VLC and IINA also work
+animecix "one piece" --player mpv
+```
+
+Homebrew builds the CLI and installs FFmpeg and shell completions. You do not
+need to install Rust manually or configure Cargo's PATH.
+
+### Fedora / DNF (x86_64)
+
+```sh
+sudo dnf install https://github.com/Phirios/animecix-cli/releases/download/v0.1.0/animecix-0.1.0-1.x86_64.rpm
+sudo dnf install mpv ffmpeg-free
+animecix "one piece" --player mpv
+```
+
+The RPM installs `animecix` in `/usr/bin` and includes shell completions. This
+is a release RPM, not a package in Fedora's default repositories. To uninstall:
+`sudo dnf remove animecix`.
+
+The GitHub repository and release assets must be public for these commands to
+work without GitHub authentication. Private-repository users can install from
+an authenticated checkout below.
+
+### From source (Linux, macOS, Windows)
+
+Requires Rust 1.88+. Playback needs a network-capable video player such as mpv,
+VLC, or IINA. Direct downloads do not need a player; HLS downloads need FFmpeg.
+
+```sh
+cargo install --git https://github.com/Phirios/animecix-cli.git --locked
+```
+
+Or install from a checkout:
 
 ```sh
 git clone https://github.com/Phirios/animecix-cli.git

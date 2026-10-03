@@ -24,7 +24,7 @@ use std::{
 #[command(
     name = "animecix",
     version,
-    about = "Search Animecix, stream in your video player, or download episodes",
+    about = "Watch and download Turkish-subtitled anime from Animecix",
     after_help = "Examples:\n  animecix \"one piece\"\n  animecix --search naruto\n  animecix --id 7293 --season 4 --episode 1\n  animecix naruto --player /Applications/VLC.app\n  animecix --id 7293 -s 4 -e 1 --download episode.mp4\n\nKeep the CLI running while watching. Ctrl+C stops streaming or cancels a download."
 )]
 struct Args {

@@ -2,7 +2,7 @@
 name = "animecix-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Search Animecix, stream anime in your video player, or download episodes"
+description = "Watch and download Turkish-subtitled anime from Animecix"
 rust-version = "1.88"
 repository = "https://github.com/Phirios/animecix-cli"
 readme = "README.md"

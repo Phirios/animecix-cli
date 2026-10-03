@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to package
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: '1.88.0'
+      - run: sudo apt-get update && sudo apt-get install -y rpm ffmpeg
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package Linux binary and RPM
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          test "$(target/release/animecix --version)" = "animecix $version"
+          bash scripts/build-rpm.sh target/release/animecix dist
+          tar -czf "dist/animecix-${version}-linux-x86_64.tar.gz" -C target/release animecix -C "$GITHUB_WORKSPACE" LICENSE README.md
+          cd dist
+          sha256sum *.rpm *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux
+          path: dist/*
+          if-no-files-found: error
+  homebrew:
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Test the formula against the tagged source
+        shell: bash
+        run: |
+          ruby -c packaging/animecix.rb
+          tap_dir=$(mktemp -d)
+          mkdir -p "$tap_dir/Formula"
+          cp packaging/animecix.rb "$tap_dir/Formula/animecix.rb"
+          export FORMULA_PATH="$tap_dir/Formula/animecix.rb"
+          export LOCAL_SOURCE="file://$GITHUB_WORKSPACE"
+          export SOURCE_REVISION="$(git rev-parse HEAD)"
+          ruby <<'RUBY'
+          path = ENV.fetch("FORMULA_PATH")
+          formula = File.read(path)
+          formula.sub!('url "https://github.com/Phirios/animecix-cli.git", tag: "v0.1.0"',
+                       "url #{ENV.fetch('LOCAL_SOURCE').inspect}, using: :git, revision: #{ENV.fetch('SOURCE_REVISION').inspect}")
+          File.write(path, formula)
+          RUBY
+          git -C "$tap_dir" init
+          git -C "$tap_dir" -c user.name=CI -c user.email=ci@example.invalid add Formula/animecix.rb
+          git -C "$tap_dir" -c user.name=CI -c user.email=ci@example.invalid commit -m 'Test animecix formula'
+          brew tap phirios/animecix-ci "$tap_dir"
+          brew install --build-from-source phirios/animecix-ci/animecix
+          brew test phirios/animecix-ci/animecix
+  publish:
+    needs: [linux, homebrew]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-linux
+          path: dist
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "animecix $RELEASE_TAG" --notes-file packaging/RELEASE_NOTES.md
+          fi
