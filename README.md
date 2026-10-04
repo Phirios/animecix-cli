@@ -22,7 +22,7 @@ need to install Rust manually or configure Cargo's PATH.
 ### Fedora / DNF (x86_64)
 
 ```sh
-sudo dnf install https://github.com/Phirios/animecix-cli/releases/download/v0.1.0/animecix-0.1.0-1.x86_64.rpm
+sudo dnf install https://github.com/Phirios/animecix-cli/releases/download/v0.1.0/animecix-cli-0.1.0-1.x86_64.rpm
 sudo dnf install mpv ffmpeg-free
 animecix "one piece" --player mpv
 ```

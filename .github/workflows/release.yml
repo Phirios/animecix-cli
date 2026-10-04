@@ -39,7 +39,8 @@ jobs:
           version="${RELEASE_TAG#v}"
           test "$(target/release/animecix --version)" = "animecix $version"
           bash scripts/build-rpm.sh target/release/animecix dist
-          tar -czf "dist/animecix-${version}-linux-x86_64.tar.gz" -C target/release animecix -C "$GITHUB_WORKSPACE" LICENSE README.md
+          mv dist/animecix-*.rpm "dist/animecix-cli-${version}-1.x86_64.rpm"
+          tar -czf "dist/animecix-cli-${version}-linux-x86_64.tar.gz" -C target/release animecix -C "$GITHUB_WORKSPACE" LICENSE README.md
           cd dist
           sha256sum *.rpm *.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -99,5 +100,5 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* --clobber
           else
-            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "animecix $RELEASE_TAG" --notes-file packaging/RELEASE_NOTES.md
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Animecix CLI ${RELEASE_TAG#v}" --notes-file packaging/RELEASE_NOTES.md
           fi

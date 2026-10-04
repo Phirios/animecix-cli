@@ -1,4 +1,4 @@
-Watch and download Turkish-subtitled anime from Animecix.
+Animecix CLI lets you search, stream, and download Turkish-subtitled anime from the terminal.
 
 - Search and select anime, seasons, fractional episodes, providers, and quality.
 - Stream through a local relay with provider headers and cookies.
@@ -6,7 +6,7 @@ Watch and download Turkish-subtitled anime from Animecix.
 - Block non-public upstream destinations and sanitize terminal output.
 - Include shell completions, MIT licensing, and offline regression tests.
 
-Fedora x86_64: install the attached RPM with `sudo dnf install ./animecix-0.1.0-1.x86_64.rpm`.
+Fedora x86_64: install the attached RPM with `sudo dnf install ./animecix-cli-0.1.0-1.x86_64.rpm`.
 
 Homebrew: `brew install phirios/tap/animecix`.
 
